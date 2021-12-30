@@ -55,8 +55,12 @@ class ServerEvents(socketio.AsyncNamespace):
 
     async def on_client_payload_done(self, sid, data):
         """ An existing client finished sending its payloads from local training. """
-        await self.plato_server.client_payload_done(sid, data['id'],
-                                                    data['obkey'])
+        if 's3_key' in data:
+            await self.plato_server.client_payload_done(sid,
+                                                        data['id'],
+                                                        s3_key=data['s3_key'])
+        else:
+            await self.plato_server.client_payload_done(sid, data['id'])
 
 
 class Server:
@@ -257,7 +261,7 @@ class Server:
             # Except for these two cases, we need to exclude the clients who are still
             # training.
             training_client_ids = [
-                self.training_clients[client_id]
+                self.training_clients[client_id]['id']
                 for client_id in list(self.training_clients.keys())
             ]
             selectable_clients = [
@@ -350,12 +354,14 @@ class Server:
         # First apply outbound processors, if any
         payload = self.outbound_processor.process(payload)
 
+        metadata = {'id': client_id}
+
         if self.s3_client is not None:
-            payload_key = f'server_payload_{os.getpid()}_{self.current_round}'
-            self.s3_client.send_to_s3(payload_key, payload)
+            s3_key = f'server_payload_{os.getpid()}_{self.current_round}'
+            self.s3_client.send_to_s3(s3_key, payload)
             data_size = sys.getsizeof(pickle.dumps(payload))
+            metadata['s3_key'] = s3_key
         else:
-            payload_key = None
             data_size = 0
 
             if isinstance(payload, list):
@@ -369,10 +375,7 @@ class Server:
                 await self.send_in_chunks(_data, sid, client_id)
                 data_size = sys.getsizeof(_data)
 
-        await self.sio.emit('payload_done', {
-            'id': client_id,
-            'obkey': payload_key
-        }, room=sid)
+        await self.sio.emit('payload_done', metadata, room=sid)
 
         logging.info("[Server #%d] Sent %s MB of payload data to client #%d.",
                      os.getpid(), round(data_size / 1024**2, 2), client_id)
@@ -404,9 +407,9 @@ class Server:
             self.client_payload[sid] = [self.client_payload[sid]]
             self.client_payload[sid].append(_data)
 
-    async def client_payload_done(self, sid, client_id, object_key):
+    async def client_payload_done(self, sid, client_id, s3_key=None):
         """ Upon receiving all the payload from a client, either via S3 or socket.io. """
-        if object_key is None:
+        if s3_key is None:
             assert self.client_payload[sid] is not None
 
             payload_size = 0
@@ -417,8 +420,7 @@ class Server:
                 payload_size = sys.getsizeof(
                     pickle.dumps(self.client_payload[sid]))
         else:
-            self.client_payload[sid] = self.s3_client.receive_from_s3(
-                object_key)
+            self.client_payload[sid] = self.s3_client.receive_from_s3(s3_key)
             payload_size = sys.getsizeof(pickle.dumps(
                 self.client_payload[sid]))
 
@@ -478,8 +480,7 @@ class Server:
                 if client_id in self.selected_clients:
                     self.selected_clients.remove(client_id)
 
-                    if len(self.updates) > 0 and len(self.updates) >= len(
-                            self.selected_clients):
+                    if len(self.updates) >= len(self.selected_clients):
                         logging.info(
                             "[Server #%d] All %d client reports received. Processing.",
                             os.getpid(), len(self.updates))
