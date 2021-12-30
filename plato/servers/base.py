@@ -18,7 +18,7 @@ from aiohttp import web
 from plato.client import run
 from plato.config import Config
 from plato.utils import s3
-
+from plato.utils import synchronizer
 
 class ServerEvents(socketio.AsyncNamespace):
     """ A custom namespace for socketio.AsyncServer. """
@@ -69,7 +69,7 @@ class Server:
         # The client ids are stored for client selection
         self.clients_pool = []
         self.clients_per_round = 0
-        self.selected_clients = None
+        self.selected_clients = []
         self.current_round = 0
         self.algorithm = None
         self.trainer = None
@@ -79,6 +79,7 @@ class Server:
         self.client_payload = {}
         self.client_chunks = {}
         self.s3_client = None
+        self.synchronizer = None
         self.outbound_processor = None
         self.inbound_processor = None
 
@@ -123,12 +124,12 @@ class Server:
         else:
             Server.start_clients(client=self.client)
 
-        if hasattr(Config().server, 'periodic_interval'):
-            asyncio.get_event_loop().create_task(self.periodic())
-
         self.start()
 
-    def start(self, port=Config().server.port):
+    def start(self, port=None):
+        # set Config().server.port as default parameter will disable the modification on Config() at runtime
+        if not port:
+            port = Config().server.port
         """ Start running the socket.io server. """
         logging.info("Starting a server at address %s and port %s.",
                      Config().server.address, port)
@@ -145,6 +146,11 @@ class Server:
 
         if hasattr(Config().server, 's3_endpoint_url'):
             self.s3_client = s3.S3()
+        
+        self.synchronizer = synchronizer.Synchronizer(self.clients_per_round, 1)
+        if hasattr(Config().server, 'synchronous_staleness'):
+            staleness_threshold = Config().server.synchronous_staleness
+            self.synchronizer.setStaleness(staleness_threshold)
 
         app = web.Application()
         self.sio.attach(app)
@@ -161,6 +167,7 @@ class Server:
                 'sid': sid,
                 'last_contacted': time.perf_counter()
             }
+            self.synchronizer.updateClient(client_id, 0)
             logging.info("[Server #%d] New client with id #%d arrived.",
                          os.getpid(), client_id)
         else:
@@ -224,8 +231,7 @@ class Server:
 
     async def select_clients(self):
         """ Select a subset of the clients and send messages to them to start training. """
-        self.updates = []
-        self.current_round += 1
+        self.current_round = self.synchronizer.trainprocess
 
         logging.info("\n[Server #%d] Starting round %s/%s.", os.getpid(),
                      self.current_round,
@@ -244,12 +250,9 @@ class Server:
 
         # In asychronous FL, avoid selecting new clients to replace those that are still
         # training at this time
-        if hasattr(Config().server, 'synchronous') and not Config(
-        ).server.synchronous and self.selected_clients is not None and len(
-                self.reporting_clients) < self.clients_per_round:
+        current_select = []
+        if self.selected_clients:
             # If self.selected_clients is None, it implies that it is the first iteration;
-            # If len(self.reporting_clients) == self.clients_per_round, it implies that
-            # all selected clients have already reported.
 
             # Except for these two cases, we need to exclude the clients who are still
             # training.
@@ -261,24 +264,41 @@ class Server:
                 client for client in self.clients_pool
                 if client not in training_client_ids
             ]
-
+            current_select = self.selected_clients.copy()
+            for i in self.reporting_clients:
+                try:
+                    current_select.remove(i)
+                except:
+                    logging.info(current_select)
+                    
             self.selected_clients = self.choose_clients(
                 selectable_clients, len(self.reporting_clients))
         else:
             self.selected_clients = self.choose_clients(
                 self.clients_pool, self.clients_per_round)
-
+            for i, selected_client_id in enumerate(self.selected_clients):
+                self.reporting_clients.append(selected_client_id)
+                
+        client_progress = {}
         if len(self.selected_clients) > 0:
             for i, selected_client_id in enumerate(self.selected_clients):
                 if hasattr(Config().clients, 'simulation') and Config(
-                ).clients.simulation and not Config().is_central_server:
-                    if hasattr(Config().server, 'synchronous') and not Config(
-                    ).server.synchronous and self.reporting_clients is not None:
-                        client_id = self.reporting_clients[i]
-                    else:
-                        client_id = i + 1
+                    ).clients.simulation and not Config().is_central_server:
+                    client_id = i + 1
+                    client_progress[client_id] = self.synchronizer.clientprogress[client_id] + 1
                 else:
                     client_id = selected_client_id
+                    client_progress[client_id] = self.synchronizer.clientprogress[self.reporting_clients[i]] + 1
+                    
+            for i, selected_client_id in enumerate(self.selected_clients):
+                if hasattr(Config().clients, 'simulation') and Config(
+                ).clients.simulation and not Config().is_central_server:
+                    client_id = i + 1
+                    self.synchronizer.updateClient(client_id, client_progress[client_id])
+                else:
+                    # the i-th client_id continues the progress of self.reporting_clients[i]
+                    client_id = selected_client_id
+                    self.synchronizer.updateClient(client_id, client_progress[client_id])
 
                 sid = self.clients[client_id]['sid']
 
@@ -304,7 +324,8 @@ class Server:
                 await self.send(sid, payload, selected_client_id)
 
                 self.training_clients[client_id] = selected_client_id
-
+            
+            self.selected_clients.extend(current_select)
             self.reporting_clients = []
 
     def choose_clients(self, clients_pool, clients_count):
@@ -313,37 +334,6 @@ class Server:
 
         # Select clients randomly
         return random.sample(clients_pool, clients_count)
-
-    async def periodic(self):
-        """ Runs periodic_task() periodically on the server. The time interval between
-            its execution is defined in 'server:periodic_interval'.
-        """
-        while True:
-            await self.periodic_task()
-            await asyncio.sleep(Config().server.periodic_interval)
-
-    async def periodic_task(self):
-        """ A periodic task that is executed from time to time, determined by
-        'server:periodic_interval' in the configuration. """
-        # Call the async function that defines a customized periodic task, if any
-        _task = getattr(self, "customize_periodic_task", None)
-        if callable(_task):
-            await self.customize_periodic_task()
-
-        # If we are operating in asynchronous mode, aggregate the model updates received so far.
-        if hasattr(Config().server,
-                   'synchronous') and not Config().server.synchronous:
-            if len(self.updates) > 0:
-                logging.info(
-                    "[Server #%d] %d client reports received in asynchronous mode. Processing.",
-                    os.getpid(), len(self.updates))
-                await self.process_reports()
-                await self.wrap_up()
-                await self.select_clients()
-            else:
-                logging.info(
-                    "[Server #%d] No client reports have been received. Nothing to process."
-                )
 
     async def send_in_chunks(self, data, sid, client_id) -> None:
         """ Sending a bytes object in fixed-sized chunks to the client. """
@@ -382,8 +372,7 @@ class Server:
         await self.sio.emit('payload_done', {
             'id': client_id,
             'obkey': payload_key
-        },
-                            room=sid)
+        }, room=sid)
 
         logging.info("[Server #%d] Sent %s MB of payload data to client #%d.",
                      os.getpid(), round(data_size / 1024**2, 2), client_id)
@@ -441,9 +430,6 @@ class Server:
             self.client_payload[sid])
         self.updates.append((self.reports[sid], self.client_payload[sid]))
 
-        self.reporting_clients.append(client_id)
-        del self.training_clients[client_id]
-
         # If all updates have been received from selected clients, the aggregation process
         # proceeds regardless of synchronous or asynchronous modes. This guarantees that
         # if asynchronous mode uses an excessively long aggregation interval, it will not
@@ -454,6 +440,26 @@ class Server:
                 os.getpid(), len(self.updates))
             await self.process_reports()
             await self.wrap_up()
+        
+        logging.info(
+            "[Server #%d] client #%d reports.", os.getpid(), client_id)
+        
+        self.synchronizer.addClientProgress(client_id)
+
+        del self.training_clients[client_id]
+        self.reporting_clients = self.synchronizer.pushcondition()
+        
+        # if there are any buffered clients
+        if len(self.reporting_clients) > 0:
+            if len(self.updates) > 0:
+                await self.process_reports()
+                await self.wrap_up()
+
+        # will this client be buffered
+        if self.synchronizer.pullcondition(client_id):
+            self.reporting_clients.append(client_id)
+            
+        if self.reporting_clients:
             await self.select_clients()
 
     async def client_disconnected(self, sid):
@@ -484,12 +490,14 @@ class Server:
     async def wrap_up(self):
         """ Wrapping up when each round of training is done. """
         # Break the loop when the target accuracy is achieved
+        self.updates = []
         target_accuracy = Config().trainer.target_accuracy
 
         if target_accuracy and self.accuracy >= target_accuracy:
             logging.info("[Server #%d] Target accuracy reached.", os.getpid())
             await self.close()
-
+        
+        self.current_round = self.synchronizer.trainprocess
         if self.current_round >= Config().trainer.rounds:
             logging.info("Target number of training rounds reached.")
             await self.close()

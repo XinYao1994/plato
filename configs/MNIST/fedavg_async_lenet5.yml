@@ -17,8 +17,10 @@ clients:
 server:
     address: 127.0.0.1
     port: 8000
-    synchronous: false
-    periodic_interval: 20
+    synchronous_staleness: 20
+    # synchronous_staleness: 0
+    # synchronous: false
+    # periodic_interval: 20
 
 data:
     # The training and testing dataset
@@ -53,7 +55,7 @@ trainer:
     target_accuracy: 0.97
 
     # Number of epoches for local training in each communication round
-    epochs: 2
+    epochs: 1
     batch_size: 32
     optimizer: SGD
     learning_rate: 0.01

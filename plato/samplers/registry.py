@@ -68,12 +68,15 @@ def get(datasource, client_id, testing=False):
             sampler_type = 'iid'
 
         logging.info("[Client #%d] Sampler: %s", client_id, sampler_type)
+        logging.info(registered_samplers)
 
     if sampler_type in registered_samplers:
         registered_sampler = registered_samplers[sampler_type](datasource,
                                                                client_id,
                                                                testing=testing)
     else:
+        # logging.info(registered_samplers)
+        # logging.info(sampler_type)
         raise ValueError('No such sampler: {}'.format(sampler_type))
 
     return registered_sampler
