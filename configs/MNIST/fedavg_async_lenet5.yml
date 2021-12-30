@@ -30,7 +30,7 @@ data:
     data_path: ./data
 
     # Number of samples in each partition
-    partition_size: 12000
+    partition_size: 2000
 
     # IID or non-IID?
     sampler: iid
