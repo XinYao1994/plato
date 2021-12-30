@@ -261,7 +261,7 @@ class Server:
             # Except for these two cases, we need to exclude the clients who are still
             # training.
             training_client_ids = [
-                self.training_clients[client_id]['id']
+                self.training_clients[client_id]
                 for client_id in list(self.training_clients.keys())
             ]
             selectable_clients = [
